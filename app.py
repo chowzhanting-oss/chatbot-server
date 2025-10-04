@@ -7,15 +7,17 @@ from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from openai import OpenAI
 
-# ------------------ Setup ------------------
 app = Flask(__name__)
 CORS(app)
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Toggle streaming via env if needed: STREAMING=off|on  (default: on)
+STREAMING_DEFAULT = os.getenv("STREAMING", "on").lower() == "on"
 
 # Simple in-memory cache {question: answer}
 answer_cache = {}
 
-# ------------------ DB ------------------
 DB_PATH = os.getenv("DB_PATH", "chat_history.db")
 
 def get_db():
@@ -39,7 +41,41 @@ def init_db():
 
 init_db()
 
-# ------------------ Routes ------------------
+# ------------ helpers ------------
+LATEX_SYSTEM = (
+    "You are a patient electronics tutor for Integrated Electronics. "
+    "Default behavior: respond briefly and clearly using short bullet points or short paragraphs. "
+    "Always format mathematical expressions using LaTeX between double dollar signs ($$ ... $$). "
+    "Example: $$ I_D = \\mu_n C_{ox} \\frac{W}{L}[(V_{GS}-V_{TH})V_{DS}-\\frac{V_{DS}^2}{2}] $$. "
+    "Only expand with detailed derivations if the user explicitly asks to 'explain more' or 'show derivation'. "
+    "If the question is off-topic, reply exactly: "
+    "Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."
+)
+
+def log_chat(student_id, question, answer):
+    try:
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO chat_logs (ts, student_id, question, answer) VALUES (?, ?, ?, ?)",
+            (datetime.utcnow().isoformat(timespec="seconds") + "Z", student_id, question, answer),
+        )
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
+def non_streaming_answer(question: str) -> str:
+    """Plain (non-streaming) call; returns full text."""
+    resp = client.responses.create(
+        model="gpt-5-mini",
+        input=[
+            {"role": "system", "content": LATEX_SYSTEM},
+            {"role": "user", "content": question},
+        ],
+    )
+    return resp.output_text or ""
+
+# ------------ routes ------------
 @app.get("/ping")
 def ping():
     return jsonify({"status": "ok"})
@@ -53,20 +89,26 @@ def chat():
     if not question:
         return jsonify({"error": "No message received"}), 400
 
-    # 1. Check cache first
-    if question in answer_cache:
-        cached = answer_cache[question]
+    # cache
+    cached = answer_cache.get(question)
+    if cached:
         return jsonify({"reply": cached, "cached": True})
 
-    # 2. Stream fresh response from OpenAI
+    # non-streaming path forced by env
+    if not STREAMING_DEFAULT:
+        answer = non_streaming_answer(question)
+        answer_cache[question] = answer
+        log_chat(student_id, question, answer)
+        return jsonify({"reply": answer})
+
+    # try streaming; if not allowed, fall back
     def generate():
         collected = []
         try:
             with client.responses.stream(
                 model="gpt-5-mini",
                 input=[
-                    {"role": "system", "content": "You are a patient tutor. Always explain step by step. Use clear formatting, line breaks, and short bullet points."},
-                    {"role": "system", "content": "If off-topic, reply exactly: Sorry I cannot help you with that, I can only answer questions about Integrated Electronics."},
+                    {"role": "system", "content": LATEX_SYSTEM},
                     {"role": "user", "content": question},
                 ],
             ) as stream:
@@ -77,23 +119,20 @@ def chat():
                         yield chunk
                 stream.close()
 
-            # Save the whole answer into cache & DB
-            full_answer = "".join(collected)
-            answer_cache[question] = full_answer
+            full = "".join(collected)
+            answer_cache[question] = full
+            log_chat(student_id, question, full)
 
-            conn = get_db()
-            conn.execute(
-                "INSERT INTO chat_logs (ts, student_id, question, answer) VALUES (?, ?, ?, ?)",
-                (datetime.utcnow().isoformat(timespec="seconds") + "Z", student_id, question, full_answer),
-            )
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            yield f"[Error: {e}]"
+        except Exception:
+            # streaming not available → non-stream fallback
+            full = non_streaming_answer(question)
+            answer_cache[question] = full
+            log_chat(student_id, question, full)
+            yield full
 
     return Response(generate(), mimetype="text/plain")
 
-# ------------------ Keep-alive thread ------------------
+# keep-alive to reduce cold starts on free tier
 def keep_alive():
     while True:
         try:
@@ -105,6 +144,5 @@ def keep_alive():
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
-# ------------------ Main ------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)
